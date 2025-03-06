@@ -23,14 +23,15 @@ type AddressMap = DashMap<u32, String>;
 
 /// Message to be sent to a client
 #[derive(Debug)]
-struct ClientMessage {
-    client_key: String,
-    message: String,
+pub struct ClientMessage {
+    pub client_key: String,
+    pub message: String,
 }
 
 /// Represents an active client connection
 struct ActiveClient {
     client_key: String,
+    #[allow(dead_code)]
     addr: SocketAddr,
     tcp_streams: RwLock<HashMap<u32, u32>>,
     pending_streams: RwLock<HashSet<u32>>,
@@ -92,6 +93,7 @@ impl ActiveClient {
 }
 
 /// The FutariRelay server
+#[derive(Clone)]
 pub struct FutariRelay {
     clients: Arc<ClientMap>,
     ip_to_client: Arc<AddressMap>,
@@ -168,12 +170,11 @@ impl FutariRelay {
 
                 for key in keys_to_remove {
                     info("Relay", &format!("Removing inactive client {}", key));
-                    if let Some((_, client)) = clients.remove(&key) {
-                        // Clean up IP mapping
-                        for entry in ip_to_client.iter() {
-                            if entry.value() == &key {
-                                ip_to_client.remove(entry.key());
-                            }
+                    clients.remove(&key);
+                    // Clean up IP mapping
+                    for entry in ip_to_client.iter() {
+                        if entry.value() == &key {
+                            ip_to_client.remove(entry.key());
                         }
                     }
                 }
@@ -197,14 +198,14 @@ impl FutariRelay {
 
     /// Handle a client connection
     async fn handle_client(
-        mut socket: TcpStream,
+        socket: TcpStream,
         addr: SocketAddr,
         clients: Arc<ClientMap>,
         ip_to_client: Arc<AddressMap>,
         message_tx: Sender<ClientMessage>,
     ) -> IoResult<()> {
         // Split the socket into a reader and writer
-        let (read_half, mut write_half) = socket.split();
+        let (read_half, mut write_half) = socket.into_split();
         let mut reader = BufReader::new(read_half);
 
         // Create a channel for sending messages to the client

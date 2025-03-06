@@ -134,6 +134,7 @@ impl Msg {
 pub mod commands {
     // Control plane commands
     pub const CTL_START: u32 = 1;
+    #[allow(dead_code)]
     pub const CTL_BIND: u32 = 2;
     pub const CTL_HEARTBEAT: u32 = 3;
     pub const CTL_TCP_CONNECT: u32 = 4;
@@ -148,6 +149,7 @@ pub mod commands {
 
 /// Protocol types
 pub mod protocols {
+    #[allow(dead_code)]
     pub const TCP: u32 = 6;
     pub const UDP: u32 = 17;
 }

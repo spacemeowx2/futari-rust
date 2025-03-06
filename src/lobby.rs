@@ -1,4 +1,4 @@
-use crate::logging::log_utils::{error, info, warn};
+use crate::logging::log_utils::{info, warn};
 use crate::types::{current_time_millis, RecruitRecord};
 
 use axum::{
@@ -9,7 +9,6 @@ use axum::{
 };
 use dashmap::DashMap;
 use serde_json::{json, Value};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
@@ -181,6 +180,7 @@ impl FutariLobby {
     }
 
     /// Get a clone of the recruit store for sharing with other components
+    #[allow(dead_code)]
     pub fn get_recruit_store(&self) -> RecruitStore {
         self.recruits.clone()
     }
