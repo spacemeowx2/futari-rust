@@ -125,7 +125,7 @@ impl FutariLobby {
 
     /// Handler for listing all recruitments
     async fn list_recruits(State(recruits): State<RecruitStore>) -> String {
-        info("Lobby", "Listing all active recruitments");
+        // info("Lobby", "Listing all active recruitments");
 
         // Remove expired recruitments first
         Self::do_cleanup(&recruits);
