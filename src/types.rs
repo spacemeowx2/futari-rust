@@ -84,6 +84,7 @@ pub struct RecruitRecord {
     #[serde(rename = "Server")]
     pub server: Option<RelayServerInfo>,
     #[serde(rename = "Time")]
+    #[serde(default)]
     pub time: i64,
 }
 
