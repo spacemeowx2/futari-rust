@@ -1,5 +1,9 @@
+use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+// Constants
+pub const PROTO_VERSION: u32 = 1;
 
 /// Relay server information
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +156,19 @@ pub mod protocols {
     #[allow(dead_code)]
     pub const TCP: u32 = 6;
     pub const UDP: u32 = 17;
+}
+
+/// Convert a keychip ID to a stub IP (virtual IP address)
+pub fn keychip_to_stub_ip(keychip: &str) -> u32 {
+    let mut hasher = Md5::new();
+    hasher.update(keychip);
+    let result = hasher.finalize();
+
+    // Convert first 4 bytes of MD5 hash to u32 (same as Kotlin implementation)
+    ((result[0] as u32 & 0xFF) << 24)
+        | ((result[1] as u32 & 0xFF) << 16)
+        | ((result[2] as u32 & 0xFF) << 8)
+        | (result[3] as u32 & 0xFF)
 }
 
 /// Utility functions

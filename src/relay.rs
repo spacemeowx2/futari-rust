@@ -1,12 +1,12 @@
 use crate::logging::log_utils::{error, info, warn};
-use crate::types::{commands, current_time_millis, protocols, Msg};
+use crate::types::{commands, current_time_millis, keychip_to_stub_ip, protocols, Msg};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Error as IoError, Result as IoResult};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use parking_lot::RwLock;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,7 +14,8 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 
 // Constants
 const MAX_STREAMS: usize = 10;
-const VERSION: &str = "Futari-Rust-Relay v0.1.0";
+const SO_TIMEOUT: u64 = 20000; // 20 seconds timeout, same as Kotlin
+const VERSION: &str = "version=1"; // 使用与Kotlin中相同的版本响应信息
 
 /// Type alias for ClientMap
 type ClientMap = DashMap<String, Arc<ActiveClient>>;
@@ -33,50 +34,64 @@ struct ActiveClient {
     client_key: String,
     #[allow(dead_code)]
     addr: SocketAddr,
-    tcp_streams: RwLock<HashMap<u32, u32>>,
-    pending_streams: RwLock<HashSet<u32>>,
+    // Maps stream ID to destination client stub IP - 使用 DashMap 替换 RwLock<HashMap>
+    tcp_streams: DashMap<u32, u32>,
+    // 使用 DashSet 替换 RwLock<HashSet>
+    pending_streams: DashSet<u32>,
     tx: Sender<String>,
     last_heartbeat: RwLock<i64>,
+    stub_ip: u32,
 }
 
 impl ActiveClient {
     fn new(client_key: String, addr: SocketAddr, tx: Sender<String>) -> Self {
+        let stub_ip = keychip_to_stub_ip(&client_key);
         Self {
             client_key,
             addr,
-            tcp_streams: RwLock::new(HashMap::new()),
-            pending_streams: RwLock::new(HashSet::new()),
+            tcp_streams: DashMap::new(),
+            pending_streams: DashSet::new(),
             tx,
             last_heartbeat: RwLock::new(current_time_millis()),
+            stub_ip,
         }
     }
 
     /// Add a pending TCP stream
     fn add_pending_stream(&self, stream_id: u32) -> bool {
-        let mut pending = self.pending_streams.write();
-        if pending.len() >= MAX_STREAMS {
+        // Check if stream ID is already in use (like Kotlin implementation)
+        if self.tcp_streams.contains_key(&stream_id) || self.pending_streams.contains(&stream_id) {
+            warn("Relay", &format!("Stream ID already in use: {}", stream_id));
             return false;
         }
-        pending.insert(stream_id);
+
+        // Check if we have too many pending streams
+        if self.pending_streams.len() >= MAX_STREAMS {
+            return false;
+        }
+
+        self.pending_streams.insert(stream_id);
         true
     }
 
     /// Accept a TCP stream, moving it from pending to active
     fn accept_stream(&self, stream_id: u32, dest_ip: u32) -> bool {
-        let mut pending = self.pending_streams.write();
-        if !pending.remove(&stream_id) {
+        if !self.pending_streams.contains(&stream_id) {
+            warn(
+                "Relay",
+                &format!("Stream ID not in pending list: {}", stream_id),
+            );
             return false;
         }
 
-        let mut streams = self.tcp_streams.write();
-        streams.insert(stream_id, dest_ip);
+        self.pending_streams.remove(&stream_id);
+        self.tcp_streams.insert(stream_id, dest_ip);
         true
     }
 
     /// Close a TCP stream
     fn close_stream(&self, stream_id: u32) -> bool {
-        let mut streams = self.tcp_streams.write();
-        streams.remove(&stream_id).is_some()
+        self.tcp_streams.remove(&stream_id).is_some()
     }
 
     /// Update the last heartbeat time
@@ -313,83 +328,200 @@ impl FutariRelay {
         // Update heartbeat time
         client.update_heartbeat();
 
+        // Get target client based on destination address or stream ID
+        let target_ip = match (msg.sid, msg.dst) {
+            (Some(sid), _) => client.tcp_streams.get(&sid).map(|v| *v),
+            (_, Some(dst_ip)) => Some(dst_ip),
+            _ => None,
+        };
+
+        let target_key = target_ip.and_then(|ip| ip_to_client.get(&ip).map(|k| k.clone()));
+
         match msg.cmd {
             commands::CTL_HEARTBEAT => {
-                // Just update the heartbeat time which was already done above
-                // No response needed
+                // Send a heartbeat response (like Kotlin implementation)
+                let response = Msg::new(commands::CTL_HEARTBEAT);
+                message_tx
+                    .send(ClientMessage {
+                        client_key: client.client_key.clone(),
+                        message: response.to_string(),
+                    })
+                    .await
+                    .map_err(|e| IoError::new(std::io::ErrorKind::Other, e.to_string()))?;
             }
 
             commands::CTL_TCP_CONNECT => {
                 // Handle TCP stream connection request
-                if let Some(sid) = msg.sid {
+                if let (Some(sid), Some(dst_ip)) = (msg.sid, msg.dst) {
+                    // Check if stream ID is already in use
                     if client.add_pending_stream(sid) {
-                        // Added to pending streams successfully
-                    } else {
-                        warn(
-                            "Relay",
-                            &format!("Client {} has too many pending streams", client.client_key),
-                        );
+                        // Forward the connection request to the target
+                        if let Some(target_key) = target_key {
+                            // Create a connect message for the target
+                            let mut connect_msg = msg.clone();
+                            connect_msg.src = Some(client.stub_ip); // Set the source IP
+                            connect_msg.dst = Some(dst_ip); // Keep the destination
+
+                            message_tx
+                                .send(ClientMessage {
+                                    client_key: target_key,
+                                    message: connect_msg.to_string(),
+                                })
+                                .await
+                                .map_err(|e| {
+                                    IoError::new(std::io::ErrorKind::Other, e.to_string())
+                                })?;
+                        } else {
+                            warn(
+                                "Relay",
+                                &format!("Connect: Target not found for IP {}", dst_ip),
+                            );
+                            client.pending_streams.remove(&sid); // Clean up pending stream
+                        }
                     }
+                } else {
+                    warn(
+                        "Relay",
+                        "Connect message missing stream ID or destination IP",
+                    );
                 }
             }
 
             commands::CTL_TCP_ACCEPT => {
                 // Handle TCP stream acceptance
                 if let (Some(sid), Some(src_ip)) = (msg.sid, msg.src) {
-                    if client.accept_stream(sid, src_ip) {
-                        // Send accept acknowledgement
-                        let mut response = Msg::new(commands::CTL_TCP_ACCEPT_ACK);
-                        response.sid = Some(sid);
-                        message_tx
-                            .send(ClientMessage {
-                                client_key: client.client_key.clone(),
-                                message: response.to_string(),
-                            })
-                            .await
-                            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    // Get the source client
+                    if let Some(src_key) = ip_to_client.get(&src_ip).map(|k| k.clone()) {
+                        if let Some(src_client) = clients.get(&src_key) {
+                            // Check if the stream is pending in the source client
+                            if src_client.pending_streams.contains(&sid) {
+                                // Remove from pending and add to active streams
+                                src_client.pending_streams.remove(&sid);
+
+                                // Update stream mappings in both clients (bidirectional)
+                                src_client.tcp_streams.insert(sid, client.stub_ip);
+                                client.tcp_streams.insert(sid, src_ip);
+
+                                // Forward the accept message to the source client
+                                let mut accept_msg = msg.clone();
+                                accept_msg.src = Some(client.stub_ip);
+                                accept_msg.dst = Some(src_ip);
+
+                                message_tx
+                                    .send(ClientMessage {
+                                        client_key: src_key,
+                                        message: accept_msg.to_string(),
+                                    })
+                                    .await
+                                    .map_err(|e| {
+                                        IoError::new(std::io::ErrorKind::Other, e.to_string())
+                                    })?;
+                            } else {
+                                warn(
+                                    "Relay",
+                                    &format!("Accept: Stream ID not in pending list: {}", sid),
+                                );
+                            }
+                        }
+                    } else {
+                        warn(
+                            "Relay",
+                            &format!("Accept: Source client not found for IP {}", src_ip),
+                        );
                     }
+                } else {
+                    warn("Relay", "Accept message missing stream ID or source IP");
                 }
             }
 
             commands::CTL_TCP_CLOSE => {
                 // Handle TCP stream closure
                 if let Some(sid) = msg.sid {
-                    client.close_stream(sid);
+                    // 获取目标IP
+                    if let Some(dst_ip) = client.tcp_streams.get(&sid).map(|v| *v) {
+                        // 关闭这个流
+                        client.close_stream(sid);
+
+                        // 处理对方端关闭
+                        if let Some(dst_key) = ip_to_client.get(&dst_ip).map(|k| k.clone()) {
+                            if let Some(dst_client) = clients.get(&dst_key) {
+                                // 找到目标客户端中的流ID
+                                let mut dst_sid = None;
+                                for item in dst_client.tcp_streams.iter() {
+                                    if *item.value() == client.stub_ip && *item.key() == sid {
+                                        dst_sid = Some(*item.key());
+                                        break;
+                                    }
+                                }
+
+                                // 关闭对方的流
+                                if let Some(s) = dst_sid {
+                                    dst_client.close_stream(s);
+
+                                    // 转发关闭消息
+                                    let mut close_msg = Msg::new(commands::CTL_TCP_CLOSE);
+                                    close_msg.sid = Some(s);
+                                    message_tx
+                                        .send(ClientMessage {
+                                            client_key: dst_key,
+                                            message: close_msg.to_string(),
+                                        })
+                                        .await
+                                        .map_err(|e| {
+                                            IoError::new(std::io::ErrorKind::Other, e.to_string())
+                                        })?;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    warn("Relay", "Close message missing stream ID");
                 }
             }
 
             commands::DATA_SEND => {
                 // Forward data to the destination client
-                if let Some(dst_ip) = msg.dst {
-                    if let Some(dst_key) = ip_to_client.get(&dst_ip) {
-                        message_tx
-                            .send(ClientMessage {
-                                client_key: dst_key.clone(),
-                                message: msg.to_string(),
-                            })
-                            .await
-                            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e.to_string()))?;
-                    }
+                if let Some(target_key) = target_key {
+                    // Copy the message and update source
+                    let mut fwd_msg = msg.clone();
+                    fwd_msg.src = Some(client.stub_ip);
+
+                    message_tx
+                        .send(ClientMessage {
+                            client_key: target_key,
+                            message: fwd_msg.to_string(),
+                        })
+                        .await
+                        .map_err(|e| IoError::new(std::io::ErrorKind::Other, e.to_string()))?;
+                } else if let Some(dst_ip) = msg.dst {
+                    warn(
+                        "Relay",
+                        &format!("Send: Target not found for IP {}", dst_ip),
+                    );
+                } else {
+                    warn("Relay", "Send: Message missing destination IP");
                 }
             }
 
             commands::DATA_BROADCAST => {
-                // Broadcast to all clients except the sender
+                // Broadcast to all clients (including the sender, like in Kotlin)
                 if msg.proto == Some(protocols::UDP) {
+                    // Create a copy of the message with updated source
+                    let mut broadcast_msg = msg.clone();
+                    broadcast_msg.src = Some(client.stub_ip);
+
                     for entry in clients.iter() {
-                        let dst_key = entry.key();
-                        if *dst_key != client.client_key {
-                            message_tx
-                                .send(ClientMessage {
-                                    client_key: dst_key.clone(),
-                                    message: msg.to_string(),
-                                })
-                                .await
-                                .map_err(|e| {
-                                    IoError::new(std::io::ErrorKind::Other, e.to_string())
-                                })?;
-                        }
+                        let dst_key = entry.key().clone();
+                        message_tx
+                            .send(ClientMessage {
+                                client_key: dst_key,
+                                message: broadcast_msg.to_string(),
+                            })
+                            .await
+                            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e.to_string()))?;
                     }
+                } else {
+                    warn("Relay", "Non-UDP broadcast received");
                 }
             }
 

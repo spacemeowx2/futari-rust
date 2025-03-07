@@ -33,3 +33,6 @@ chrono = "0.4"
 # Concurrency
 dashmap = "5.5"
 parking_lot = "0.12"
+
+# 添加的新依赖
+md-5 = "0.10.6"
