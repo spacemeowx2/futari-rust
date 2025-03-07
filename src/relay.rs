@@ -74,22 +74,6 @@ impl ActiveClient {
         true
     }
 
-    /// Accept a TCP stream, moving it from pending to active
-    #[allow(dead_code)]
-    fn accept_stream(&self, stream_id: u32, dest_ip: u32) -> bool {
-        if !self.pending_streams.contains(&stream_id) {
-            warn(
-                "Relay",
-                &format!("Stream ID not in pending list: {}", stream_id),
-            );
-            return false;
-        }
-
-        self.pending_streams.remove(&stream_id);
-        self.tcp_streams.insert(stream_id, dest_ip);
-        true
-    }
-
     /// Close a TCP stream
     fn close_stream(&self, stream_id: u32) -> bool {
         self.tcp_streams.remove(&stream_id).is_some()
@@ -276,10 +260,8 @@ impl FutariRelay {
         // Store the client
         clients.insert(client_key.clone(), client.clone());
 
-        // Register the client's IP
-        if let Some(src_ip) = msg.src {
-            ip_to_client.insert(src_ip, client_key.clone());
-        }
+        ip_to_client.insert(client.stub_ip, client_key.clone());
+        info("Relay", &format!("ip_to_client {:?}", ip_to_client));
 
         // Send version information back
         let mut response = Msg::new(commands::CTL_START);
@@ -321,6 +303,8 @@ impl FutariRelay {
 
         // Clean up when the connection closes
         clients.remove(&client_key);
+        // Remove IP-to-client mapping when client disconnects
+        ip_to_client.retain(|_, v| v != &client_key);
         write_task.abort();
 
         info("Relay", &format!("Client {} disconnected", addr));
@@ -339,13 +323,18 @@ impl FutariRelay {
         client.update_heartbeat();
 
         // Get target client based on destination address or stream ID
-        let target_ip = match (msg.sid, msg.dst) {
+        let mut target_ip = match (msg.sid, msg.dst) {
             (Some(sid), _) => client.tcp_streams.get(&sid).map(|v| *v),
-            (_, Some(dst_ip)) => Some(dst_ip),
             _ => None,
         };
+        if let (Some(dst_ip), None) = (msg.dst, target_ip) {
+            target_ip = Some(dst_ip);
+        }
 
         let target_key = target_ip.and_then(|ip| ip_to_client.get(&ip).map(|k| k.clone()));
+        let target_client = target_key
+            .clone()
+            .and_then(|k| clients.get(&k).map(|c| c.clone()));
 
         match msg.cmd {
             commands::CTL_HEARTBEAT => {
@@ -366,15 +355,15 @@ impl FutariRelay {
                     // Check if stream ID is already in use
                     if client.add_pending_stream(sid) {
                         // Forward the connection request to the target
-                        if let Some(target_key) = target_key {
+                        if let (Some(target_key), Some(target)) = (&target_key, target_client) {
                             // Create a connect message for the target
                             let mut connect_msg = msg.clone();
                             connect_msg.src = Some(client.stub_ip); // Set the source IP
-                            connect_msg.dst = Some(dst_ip); // Keep the destination
+                            connect_msg.dst = Some(target.stub_ip);
 
                             message_tx
                                 .send(ClientMessage {
-                                    client_key: target_key,
+                                    client_key: target_key.to_string(),
                                     message: connect_msg.to_string(),
                                 })
                                 .await
@@ -382,9 +371,13 @@ impl FutariRelay {
                                     IoError::new(std::io::ErrorKind::Other, e.to_string())
                                 })?;
                         } else {
+                            info("Relay", &format!("ip_to_client {:?}", ip_to_client));
                             warn(
                                 "Relay",
-                                &format!("Connect: Target not found for IP {}", dst_ip),
+                                &format!(
+                                    "Connect: Target not found for IP {}, {:?}, {:?}, {:?}",
+                                    dst_ip, target_ip, target_key, msg
+                                ),
                             );
                             client.pending_streams.remove(&sid); // Clean up pending stream
                         }
@@ -400,44 +393,39 @@ impl FutariRelay {
             commands::CTL_TCP_ACCEPT => {
                 // Handle TCP stream acceptance
                 if let (Some(sid), Some(src_ip)) = (msg.sid, msg.src) {
-                    // Get the source client
-                    if let Some(src_key) = ip_to_client.get(&src_ip).map(|k| k.clone()) {
-                        if let Some(src_client) = clients.get(&src_key) {
-                            // Check if the stream is pending in the source client
-                            if src_client.pending_streams.contains(&sid) {
-                                // Remove from pending and add to active streams
-                                src_client.pending_streams.remove(&sid);
+                    if let (Some(target_key), Some(target)) = (target_key, target_client) {
+                        // Check if the stream is pending in the source client
+                        if target.pending_streams.contains(&sid) {
+                            // Remove from pending and add to active streams
+                            target.pending_streams.remove(&sid);
 
-                                // Update stream mappings in both clients (bidirectional)
-                                src_client.tcp_streams.insert(sid, client.stub_ip);
-                                client.tcp_streams.insert(sid, src_ip);
+                            // Update stream mappings in both clients (bidirectional)
+                            target.tcp_streams.insert(sid, client.stub_ip);
+                            client.tcp_streams.insert(sid, target.stub_ip);
 
-                                // Forward the accept message to the source client
-                                let mut accept_msg = msg.clone();
-                                accept_msg.src = Some(client.stub_ip);
-                                accept_msg.dst = Some(src_ip);
+                            // Forward the accept message to the source client
+                            let mut accept_msg = msg.clone();
+                            accept_msg.src = Some(client.stub_ip);
+                            accept_msg.dst = Some(target.stub_ip);
 
-                                message_tx
-                                    .send(ClientMessage {
-                                        client_key: src_key,
-                                        message: accept_msg.to_string(),
-                                    })
-                                    .await
-                                    .map_err(|e| {
-                                        IoError::new(std::io::ErrorKind::Other, e.to_string())
-                                    })?;
-                            } else {
-                                warn(
-                                    "Relay",
-                                    &format!("Accept: Stream ID not in pending list: {}", sid),
-                                );
-                            }
+                            message_tx
+                                .send(ClientMessage {
+                                    client_key: target_key.to_string(),
+                                    message: accept_msg.to_string(),
+                                })
+                                .await
+                                .map_err(|e| {
+                                    IoError::new(std::io::ErrorKind::Other, e.to_string())
+                                })?;
+                        } else {
+                            warn(
+                                "Relay",
+                                &format!(
+                                    "Accept: Stream ID not in pending list: {}, {:?}",
+                                    sid, target.pending_streams
+                                ),
+                            );
                         }
-                    } else {
-                        warn(
-                            "Relay",
-                            &format!("Accept: Source client not found for IP {}", src_ip),
-                        );
                     }
                 } else {
                     warn("Relay", "Accept message missing stream ID or source IP");
@@ -471,6 +459,9 @@ impl FutariRelay {
                                     // 转发关闭消息
                                     let mut close_msg = Msg::new(commands::CTL_TCP_CLOSE);
                                     close_msg.sid = Some(s);
+                                    // Add explicit src/dst IPs for consistency with other messages
+                                    close_msg.src = Some(client.stub_ip);
+                                    close_msg.dst = Some(dst_client.stub_ip);
                                     message_tx
                                         .send(ClientMessage {
                                             client_key: dst_key,
@@ -491,11 +482,19 @@ impl FutariRelay {
 
             commands::DATA_SEND => {
                 // Forward data to the destination client
-                if let Some(target_key) = target_key {
+                if let (Some(target_key), Some(target)) = (target_key, target_client) {
                     // Copy the message and update source
                     let mut fwd_msg = msg.clone();
                     fwd_msg.src = Some(client.stub_ip);
+                    fwd_msg.dst = Some(target.stub_ip);
 
+                    info(
+                        "Relay",
+                        &format!(
+                            "Send: {} -> {} {:?}, {:?}",
+                            client.client_key, target_key, client.tcp_streams, target.tcp_streams
+                        ),
+                    );
                     message_tx
                         .send(ClientMessage {
                             client_key: target_key,

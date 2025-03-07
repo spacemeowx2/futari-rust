@@ -136,7 +136,6 @@ impl FutariLobby {
             // Create a filtered version of the record without keychip and time
             let filtered_record = json!({
                 "RecruitInfo": record.value().recruit_info,
-                "Server": record.value().server
             });
 
             result.push_str(&filtered_record.to_string());

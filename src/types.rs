@@ -175,8 +175,8 @@ impl Msg {
             |opt: &Option<u32>| -> String { opt.map_or(String::new(), |val| val.to_string()) };
 
         // Format according to the Kotlin implementation
-        format!(
-            "{},{},{},{},{},{},{},{},,,,,,,,{},",
+        let result = format!(
+            "{},{},{},{},{},{},{},{},,,,,,,,{}",
             PROTO_VERSION,
             self.cmd,
             to_str(&self.proto),
@@ -186,7 +186,9 @@ impl Msg {
             to_str(&self.dst),
             to_str(&self.d_port),
             self.data.as_deref().unwrap_or("")
-        )
+        );
+
+        result.trim_end_matches(',').to_string()
     }
 }
 
