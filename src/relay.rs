@@ -1,7 +1,6 @@
 use crate::logging::log_utils::{error, info, warn};
 use crate::types::{commands, current_time_millis, keychip_to_stub_ip, protocols, Msg};
 
-use std::collections::HashMap;
 use std::io::{Error as IoError, Result as IoResult};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,6 +13,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 
 // Constants
 const MAX_STREAMS: usize = 10;
+#[allow(dead_code)]
 const SO_TIMEOUT: u64 = 20000; // 20 seconds timeout, same as Kotlin
 const VERSION: &str = "version=1"; // 使用与Kotlin中相同的版本响应信息
 
@@ -75,6 +75,7 @@ impl ActiveClient {
     }
 
     /// Accept a TCP stream, moving it from pending to active
+    #[allow(dead_code)]
     fn accept_stream(&self, stream_id: u32, dest_ip: u32) -> bool {
         if !self.pending_streams.contains(&stream_id) {
             warn(
@@ -145,6 +146,7 @@ impl FutariRelay {
             match listener.accept().await {
                 Ok((socket, addr)) => {
                     info("Relay", &format!("New connection from {}", addr));
+                    socket.set_nodelay(true)?;
                     let clients = self.clients.clone();
                     let ip_to_client = self.ip_to_client.clone();
                     let message_tx = self.message_tx.clone();
@@ -230,7 +232,14 @@ impl FutariRelay {
         let mut buf = String::new();
         reader.read_line(&mut buf).await?;
 
-        let msg = match Msg::parse(&buf) {
+        // Remove UTF-8 BOM if present
+        let clean_buf = if buf.starts_with('\u{feff}') {
+            &buf[3..]
+        } else {
+            &buf[..]
+        };
+
+        let msg = match Msg::parse(clean_buf) {
             Some(msg) if msg.cmd == commands::CTL_START => msg,
             _ => {
                 error(
@@ -283,7 +292,8 @@ impl FutariRelay {
         // Spawn a task to forward messages to the client
         let write_task = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
-                if let Err(e) = write_half.write_all(msg.as_bytes()).await {
+                let msg_with_newline = format!("{}\n", msg);
+                if let Err(e) = write_half.write_all(msg_with_newline.as_bytes()).await {
                     error("Relay", &format!("Write error: {}", e));
                     break;
                 }

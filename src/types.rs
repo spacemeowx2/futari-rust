@@ -3,40 +3,70 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // Constants
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: &str = "1";
 
 /// Relay server information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayServerInfo {
-    pub address: String,
+    pub name: String,
+    pub addr: String,
+    #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_true")]
+    pub official: bool,
+}
+
+fn default_port() -> u16 {
+    20101
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Information about a mecha
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MechaInfo {
+    #[serde(rename = "IsJoin")]
     pub is_join: bool,
+    #[serde(rename = "IpAddress")]
     pub ip_address: u32, // IP address as UInt
+    #[serde(rename = "MusicID")]
     pub music_id: i32,
+    #[serde(rename = "Entrys")]
     pub entrys: Vec<bool>,
+    #[serde(rename = "UserIDs")]
     pub user_ids: Vec<i64>,
+    #[serde(rename = "UserNames")]
     pub user_names: Vec<String>,
+    #[serde(rename = "IconIDs")]
     pub icon_ids: Vec<i32>,
+    #[serde(rename = "FumenDifs")]
     pub fumen_difs: Vec<i32>,
+    #[serde(rename = "Rateing")]
     pub rateing: Vec<i32>,
+    #[serde(rename = "ClassValue")]
     pub class_value: Vec<i32>,
+    #[serde(rename = "MaxClassValue")]
     pub max_class_value: Vec<i32>,
+    #[serde(rename = "UserType")]
     pub user_type: Vec<i32>,
 }
 
 /// Recruitment information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecruitInfo {
+    #[serde(rename = "MechaInfo")]
     pub mecha_info: MechaInfo,
+    #[serde(rename = "MusicID")]
     pub music_id: i32,
+    #[serde(rename = "GroupID")]
     pub group_id: i32,
+    #[serde(rename = "EventModeID")]
     pub event_mode_id: bool,
+    #[serde(rename = "JoinNumber")]
     pub join_number: i32,
+    #[serde(rename = "PartyStance")]
     pub party_stance: i32,
     #[serde(rename = "_startTimeTicks")]
     pub start_time_ticks: i64,
@@ -86,49 +116,74 @@ impl Msg {
 
     /// Parse a message from a comma-delimited string
     pub fn parse(input: &str) -> Option<Self> {
+        // Ignore the newline character at the end
+        let input = input.trim_end_matches('\n');
         let parts: Vec<&str> = input.split(',').collect();
-        if parts.len() < 17 || parts[0] != "1" {
+        // Check only that the first part is "1" (protocol identifier)
+        // and we have at least a command part (index 1)
+        if parts.len() < 2 || parts[0] != PROTO_VERSION {
             return None;
         }
 
-        let parse_uint = |s: &str| -> Option<u32> {
-            if s.is_empty() {
-                None
-            } else {
-                s.parse::<u32>().ok()
-            }
+        // Create a new message with default command 0
+        // We'll update the command and other fields below
+        let mut msg = Msg::new(0);
+
+        // Parse the command
+        if let Ok(cmd) = parts.get(1).unwrap_or(&"").parse::<u32>() {
+            msg.cmd = cmd;
+        } else {
+            return None;
+        }
+
+        // Helper function to parse fields
+        let parse_field = |index: usize| {
+            parts.get(index).and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    s.parse::<u32>().ok()
+                }
+            })
         };
 
-        Some(Msg {
-            cmd: parse_uint(parts[1])?,
-            proto: parse_uint(parts[2]),
-            sid: parse_uint(parts[3]),
-            src: parse_uint(parts[4]),
-            s_port: parse_uint(parts[5]),
-            dst: parse_uint(parts[6]),
-            d_port: parse_uint(parts[7]),
-            data: if parts[16].is_empty() {
-                None
-            } else {
-                Some(parts[16].to_string())
-            },
-        })
+        // Set fields in order similar to Kotlin implementation
+        // Only try to parse fields if they exist in the input
+        msg.proto = parse_field(2);
+        msg.sid = parse_field(3);
+        msg.src = parse_field(4);
+        msg.s_port = parse_field(5);
+        msg.dst = parse_field(6);
+        msg.d_port = parse_field(7);
+
+        // Parse the data field (index 16), if it exists
+        if parts.len() > 16 {
+            let data_value = parts[16];
+            if !data_value.is_empty() {
+                msg.data = Some(data_value.to_string());
+            }
+        }
+
+        Some(msg)
     }
 
     /// Convert the message to a string for transmission
     pub fn to_string(&self) -> String {
-        let fmt_uint =
+        // Helper function to format optional u32 values
+        let to_str =
             |opt: &Option<u32>| -> String { opt.map_or(String::new(), |val| val.to_string()) };
 
+        // Format according to the Kotlin implementation
         format!(
-            "1,{},{},{},{},{},{},{},,,,,,,,{},",
+            "{},{},{},{},{},{},{},{},,,,,,,,{},",
+            PROTO_VERSION,
             self.cmd,
-            fmt_uint(&self.proto),
-            fmt_uint(&self.sid),
-            fmt_uint(&self.src),
-            fmt_uint(&self.s_port),
-            fmt_uint(&self.dst),
-            fmt_uint(&self.d_port),
+            to_str(&self.proto),
+            to_str(&self.sid),
+            to_str(&self.src),
+            to_str(&self.s_port),
+            to_str(&self.dst),
+            to_str(&self.d_port),
             self.data.as_deref().unwrap_or("")
         )
     }
@@ -141,8 +196,9 @@ pub mod commands {
     #[allow(dead_code)]
     pub const CTL_BIND: u32 = 2;
     pub const CTL_HEARTBEAT: u32 = 3;
-    pub const CTL_TCP_CONNECT: u32 = 4;
+    pub const CTL_TCP_CONNECT: u32 = 4; // Accept a new multiplexed TCP stream
     pub const CTL_TCP_ACCEPT: u32 = 5;
+    #[allow(dead_code)]
     pub const CTL_TCP_ACCEPT_ACK: u32 = 6;
     pub const CTL_TCP_CLOSE: u32 = 7;
 
@@ -176,5 +232,27 @@ pub fn current_time_millis() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_millis() as i64,
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_heartbeat() {
+        // Test parsing a simple heartbeat message "1,3"
+        let msg = Msg::parse("1,3");
+        assert!(msg.is_some(), "Failed to parse heartbeat message");
+
+        let msg = msg.unwrap();
+        assert_eq!(msg.cmd, 3, "Command should be 3 (heartbeat)");
+        assert!(msg.proto.is_none(), "Proto should be None");
+        assert!(msg.sid.is_none(), "Session ID should be None");
+        assert!(msg.src.is_none(), "Source should be None");
+        assert!(msg.s_port.is_none(), "Source port should be None");
+        assert!(msg.dst.is_none(), "Destination should be None");
+        assert!(msg.d_port.is_none(), "Destination port should be None");
+        assert!(msg.data.is_none(), "Data should be None");
     }
 }

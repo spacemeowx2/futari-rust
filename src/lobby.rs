@@ -134,7 +134,7 @@ impl FutariLobby {
         let mut result = String::new();
         for record in recruits.iter() {
             // Create a filtered version of the record without keychip and time
-            let mut filtered_record = json!({
+            let filtered_record = json!({
                 "RecruitInfo": record.value().recruit_info,
                 "Server": record.value().server
             });
@@ -147,6 +147,7 @@ impl FutariLobby {
     }
 
     /// Handler for cleaning expired recruitments
+    #[allow(dead_code)]
     async fn clean_recruits(State(recruits): State<RecruitStore>) -> StatusCode {
         info("Lobby", "Cleaning expired recruitments");
         Self::do_cleanup(&recruits);
