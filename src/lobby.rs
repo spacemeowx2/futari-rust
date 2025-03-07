@@ -3,7 +3,7 @@ use crate::types::{current_time_millis, RecruitRecord};
 
 use axum::{
     extract::State,
-    http::StatusCode,
+    http::{Request, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 const MAX_TTL: i64 = 30_000;
 
 /// Type alias for the recruitment storage
-type RecruitStore = Arc<DashMap<String, RecruitRecord>>;
+type RecruitStore = Arc<DashMap<u32, RecruitRecord>>;
 
 /// The FutariLobby service
 pub struct FutariLobby {
@@ -44,7 +44,7 @@ impl FutariLobby {
             .route("/recruit/start", post(Self::start_recruit))
             .route("/recruit/finish", post(Self::finish_recruit))
             .route("/recruit/list", get(Self::list_recruits))
-            .route("/recruit/clean", get(Self::clean_recruits))
+            .route("/info", get(Self::relay_info))
             .route("/debug", get(Self::debug_info))
             .with_state(state);
 
@@ -83,12 +83,17 @@ impl FutariLobby {
         // Update the record with current time
         record.time = current_time_millis();
 
+        // Get IP address from record
+        let ip = record.recruit_info.mecha_info.ip_address;
+
+        // Log if this is a new recruitment
+        let exists = recruits.contains_key(&ip);
+        if !exists {
+            info("Lobby", &format!("New recruitment from IP: {}", ip));
+        }
+
         // Store the recruitment
-        info(
-            "Lobby",
-            &format!("New recruitment from keychip: {}", record.keychip),
-        );
-        recruits.insert(record.keychip.clone(), record);
+        recruits.insert(ip, record);
 
         StatusCode::OK
     }
@@ -98,29 +103,47 @@ impl FutariLobby {
         State(recruits): State<RecruitStore>,
         Json(record): Json<RecruitRecord>,
     ) -> StatusCode {
-        if recruits.contains_key(&record.keychip) {
-            info(
-                "Lobby",
-                &format!("Completing recruitment: {}", record.keychip),
-            );
-            recruits.remove(&record.keychip);
-            StatusCode::OK
-        } else {
-            warn(
-                "Lobby",
-                &format!("Recruitment not found: {}", record.keychip),
-            );
-            StatusCode::NOT_FOUND
+        let ip = record.recruit_info.mecha_info.ip_address;
+
+        if !recruits.contains_key(&ip) {
+            warn("Lobby", &format!("Recruitment not found for IP: {}", ip));
+            return StatusCode::NOT_FOUND;
         }
+
+        // Check if keychip matches
+        if let Some(existing) = recruits.get(&ip) {
+            if existing.keychip != record.keychip {
+                warn("Lobby", &format!("Keychip mismatch for IP: {}", ip));
+                return StatusCode::BAD_REQUEST;
+            }
+        }
+
+        info("Lobby", &format!("Completing recruitment for IP: {}", ip));
+        recruits.remove(&ip);
+        StatusCode::OK
     }
 
     /// Handler for listing all recruitments
-    async fn list_recruits(State(recruits): State<RecruitStore>) -> Json<Vec<RecruitRecord>> {
+    async fn list_recruits(State(recruits): State<RecruitStore>) -> String {
         info("Lobby", "Listing all active recruitments");
-        let records: Vec<RecruitRecord> =
-            recruits.iter().map(|entry| entry.value().clone()).collect();
 
-        Json(records)
+        // Remove expired recruitments first
+        Self::do_cleanup(&recruits);
+
+        // Collect all active recruitments
+        let mut result = String::new();
+        for record in recruits.iter() {
+            // Create a filtered version of the record without keychip and time
+            let mut filtered_record = json!({
+                "RecruitInfo": record.value().recruit_info,
+                "Server": record.value().server
+            });
+
+            result.push_str(&filtered_record.to_string());
+            result.push('\n');
+        }
+
+        result
     }
 
     /// Handler for cleaning expired recruitments
@@ -151,31 +174,51 @@ impl FutariLobby {
     }
 
     /// Handler for debug information
-    async fn debug_info(State(recruits): State<RecruitStore>) -> Json<Value> {
+    async fn debug_info<B>(req: Request<B>) -> Json<Value> {
         info("Lobby", "Debug info requested");
 
-        // Get active recruitment count
-        let recruit_count = recruits.len();
+        // Build debug response similar to the Kotlin implementation
+        Json(json!({
+            "serverHost": req.headers().get("host")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("unknown"),
+            "remoteHost": req.headers().get("x-forwarded-for")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("unknown"),
+            "localHost": "127.0.0.1",
+            "serverPort": 20100,
+            "remotePort": 0,
+            "localPort": 0,
+            "uri": req.uri().to_string(),
+            "method": req.method().to_string(),
+            "headers": req.headers().iter()
+                .map(|(k, v)| format!("{}: {}", k, v.to_str().unwrap_or("invalid")))
+                .collect::<Vec<String>>()
+                .join("\n")
+        }))
+    }
 
-        // Get system information
-        let memory_usage = match std::process::Command::new("ps")
-            .args(&["-o", "rss=", "-p", &std::process::id().to_string()])
-            .output()
-        {
-            Ok(output) => {
-                let rss = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                format!("{}KB", rss)
+    /// Handler for relay server information
+    async fn relay_info<B>(req: Request<B>) -> Json<Value> {
+        let host_override = std::env::var("HOST_OVERRIDE").ok();
+
+        // Get server host from the request if host override is not set
+        let server_host = match host_override {
+            Some(host) => host,
+            None => {
+                let headers = req.headers();
+                let host_header = headers
+                    .get("host")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.split(':').next().unwrap_or("127.0.0.1").to_string())
+                    .unwrap_or_else(|| "127.0.0.1".to_string());
+                host_header
             }
-            Err(_) => "Unknown".to_string(),
         };
 
-        // Build debug response
         Json(json!({
-            "version": "Futari-Rust v0.1.0",
-            "uptime": "N/A", // Would need to track server start time
-            "activeConnections": recruit_count,
-            "memoryUsage": memory_usage,
-            "timestamp": current_time_millis(),
+            "relayHost": server_host,
+            "relayPort": 20101
         }))
     }
 
